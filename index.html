@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sismografo Verticale PWA</title>
+  <!-- Chart.js per il grafico in tempo reale -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      margin: 0;
+      padding: 16px;
+      background-color: #121212;
+      color: #ffffff;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+    h1 {
+      font-size: 1.2rem;
+      margin-bottom: 16px;
+      text-align: center;
+    }
+    .controls {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 16px;
+      width: 100%;
+      max-width: 400px;
+    }
+    button {
+      flex: 1;
+      padding: 12px;
+      font-size: 1rem;
+      font-weight: bold;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+    }
+    #btnStart { background-color: #4CAF50; color: white; }
+    #btnStop { background-color: #f44336; color: white; }
+    #btnReset { background-color: #ff9800; color: white; }
+    .telemetry {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      width: 100%;
+      max-width: 400px;
+      margin-bottom: 16px;
+    }
+    .card {
+      background: #1e1e1e;
+      padding: 10px;
+      border-radius: 8px;
+      text-align: center;
+    }
+    .card label { font-size: 0.75rem; color: #aaa; display: block; }
+    .card span { font-size: 1.1rem; font-weight: bold; color: #00E5FF; }
+    .chart-container {
+      position: relative;
+      width: 100%;
+      max-width: 600px;
+      height: 350px;
+      background: #1e1e1e;
+      border-radius: 8px;
+      padding: 8px;
+      box-sizing: border-box;
+    }
+  </style>
+</head>
+<body>
+
+  <h1>Sismografo Verticale (Z-Axis)</h1>
+
+  <div class="controls">
+    <button id="btnStart">AVVIA</button>
+    <button id="btnStop" disabled>FERMA</button>
+    <button id="btnReset">RESET</button>
+  </div>
+
+  <div class="telemetry">
+    <div class="card">
+      <label>ACCELERAZIONE VERTICALE</label>
+      <span id="valAcc">0.00 m/s²</span>
+    </div>
+    <div class="card">
+      <label>SPOSTAMENTO CALCOLATO</label>
+      <span id="valDisp">0.00 mm</span>
+    </div>
+  </div>
+
+  <div class="chart-container">
+    <canvas id="seismoChart"></canvas>
+  </div>
+
+  <script>
+    // Variables per la fisica e il filtraggio
+    let isTracking = false;
+    let lastTime = null;
+    let velocity = 0;      // m/s
+    let displacement = 0;  // m
+    let filteredAcc = 0;   // m/s²
+    const alpha = 0.85;    // Coefficiente filtro passa-alto per ridurre la deriva (drift)
+
+    // Elementi DOM
+    const btnStart = document.getElementById('btnStart');
+    const btnStop = document.getElementById('btnStop');
+    const btnReset = document.getElementById('btnReset');
+    const valAcc = document.getElementById('valAcc');
+    const valDisp = document.getElementById('valDisp');
+
+    // Configurazione Chart.js
+    const ctx = document.getElementById('seismoChart').getContext('2d');
+    const chart = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: [],
+        datasets: [{
+          label: 'Spostamento Verticale (mm)',
+          data: [],
+          borderColor: '#00E5FF',
+          borderWidth: 2,
+          pointRadius: 0,
+          tension: 0.2
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: false,
+        scales: {
+          x: {
+            title: { display: true, text: 'Tempo (s)', color: '#888' },
+            ticks: { color: '#888' },
+            grid: { color: '#333' }
+          },
+          y: {
+            title: { display: true, text: 'Spostamento (mm)', color: '#888' },
+            ticks: { color: '#888' },
+            grid: { color: '#333' }
+          }
+        },
+        plugins: {
+          legend: { labels: { color: '#fff' } }
+        }
+      }
+    });
+
+    let startTime = 0;
+
+    // Gestione Evento Accelerometro
+    function handleMotion(event) {
+      if (!isTracking) return;
+
+      const now = performance.now();
+      if (!lastTime) {
+        lastTime = now;
+        startTime = now;
+        return;
+      }
+
+      const dt = (now - lastTime) / 1000; // Converti ms in secondi
+      lastTime = now;
+
+      if (dt <= 0 || dt > 0.5) return; // Salta misurazioni anomale
+
+      // Prendi l'accelerazione depurata dalla gravità se disponibile, altrimenti usa l'asse Z
+      let rawAcc = 0;
+      if (event.acceleration && event.acceleration.z !== null) {
+        rawAcc = event.acceleration.z;
+      } else if (event.accelerationIncludingGravity && event.accelerationIncludingGravity.z !== null) {
+        rawAcc = event.accelerationIncludingGravity.z - 9.81;
+      }
+
+      // 1. Filtro passa-alto per eliminare il bias statico e la gravità residua
+      filteredAcc = alpha * (filteredAcc + rawAcc - (this.lastRawAcc || 0));
+      this.lastRawAcc = rawAcc;
+
+      // Piccola soglia di rumore (Deadband)
+      let cleanAcc = Math.abs(filteredAcc) < 0.05 ? 0 : filteredAcc;
+
+      // 2. Prima Integrazione (Velocità) con smorzamento per la deriva
+      velocity = (velocity + cleanAcc * dt) * 0.98;
+
+      // 3. Seconda Integrazione (Spostamento)
+      displacement = (displacement + velocity * dt) * 0.98;
+
+      const dispMM = displacement * 1000; // Converti in millimetri
+      const elapsedTime = ((now - startTime) / 1000).toFixed(1);
+
+      // Aggiorna Interfaccia
+      valAcc.innerText = `${cleanAcc.toFixed(2)} m/s²`;
+      valDisp.innerText = `${dispMM.toFixed(2)} mm`;
+
+      // Aggiorna Grafico (mantiene gli ultimi 100 punti per fluidità)
+      chart.data.labels.push(elapsedTime);
+      chart.data.datasets[0].data.push(dispMM);
+
+      if (chart.data.labels.length > 100) {
+        chart.data.labels.shift();
+        chart.data.datasets[0].data.shift();
+      }
+
+      chart.update('none'); // Update ottimizzato senza animazioni laggy
+    }
+
+    // Avvio e permessi
+    btnStart.addEventListener('click', async () => {
+      // Richiesta permessi obbligatoria per dispositivi iOS
+      if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function') {
+        try {
+          const response = await DeviceMotionEvent.requestPermission();
+          if (response !== 'granted') {
+            alert('Permesso per i sensori negato.');
+            return;
+          }
+        } catch (e) {
+          console.error(e);
+        }
+      }
+
+      isTracking = true;
+      lastTime = null;
+      window.addEventListener('devicemotion', handleMotion);
+      btnStart.disabled = true;
+      btnStop.disabled = false;
+    });
+
+    // Arresto
+    btnStop.addEventListener('click', () => {
+      isTracking = false;
+      window.removeEventListener('devicemotion', handleMotion);
+      btnStart.disabled = false;
+      btnStop.disabled = true;
+    });
+
+    // Reset
+    btnReset.addEventListener('click', () => {
+      velocity = 0;
+      displacement = 0;
+      filteredAcc = 0;
+      chart.data.labels = [];
+      chart.data.datasets[0].data = [];
+      chart.update();
+      valAcc.innerText = "0.00 m/s²";
+      valDisp.innerText = "0.00 mm";
+    });
+  </script>
+</body>
+</html>
